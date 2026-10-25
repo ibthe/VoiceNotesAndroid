@@ -23,9 +23,17 @@ android {
         jvmTarget = "17"
     }
     buildFeatures { compose = true }
+    // ONNX weights are packaged as-is; sherpa-onnx loads them from APK assets.
+    androidResources {
+        noCompress += listOf("onnx")
+    }
+    packaging {
+        jniLibs { useLegacyPackaging = true }
+    }
 }
 
 dependencies {
+    implementation("com.xdcobra.sherpa:sherpa-onnx:1.13.8-1")
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)

@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APK (offline Whisper)
 
 on:
   push:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -26,13 +27,32 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      # Model weights are fetched during CI and embedded in the APK's assets.
+      # The installed app does not download models and does not need Internet for ASR.
+      - name: Download and stage multilingual Whisper tiny model
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-delay 2 \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2 \
+            --output /tmp/sherpa-onnx-whisper-tiny.tar.bz2
+          mkdir -p /tmp/whisper-model app/src/main/assets/models
+          tar -xjf /tmp/sherpa-onnx-whisper-tiny.tar.bz2 -C /tmp/whisper-model
+          find /tmp/whisper-model -name 'tiny-encoder.int8.onnx' -print -quit | grep -q .
+          find /tmp/whisper-model -name 'tiny-decoder.int8.onnx' -print -quit | grep -q .
+          find /tmp/whisper-model -name 'tiny-tokens.txt' -print -quit | grep -q .
+          cp "$(find /tmp/whisper-model -name 'tiny-encoder.int8.onnx' -print -quit)" app/src/main/assets/models/
+          cp "$(find /tmp/whisper-model -name 'tiny-decoder.int8.onnx' -print -quit)" app/src/main/assets/models/
+          cp "$(find /tmp/whisper-model -name 'tiny-tokens.txt' -print -quit)" app/src/main/assets/models/
+          ls -lh app/src/main/assets/models
+
       - name: Build debug APK
         run: gradle --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: VoiceNotes-debug-apk
+          name: VoiceNotes-debug-apk-offline-whisper
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14

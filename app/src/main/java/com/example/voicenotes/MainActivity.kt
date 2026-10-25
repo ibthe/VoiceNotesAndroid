@@ -1,13 +1,11 @@
 package com.example.voicenotes
 
 import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Build
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -35,6 +33,11 @@ import androidx.core.content.ContextCompat
 import androidx.room.Room
 import com.example.voicenotes.data.Note
 import com.example.voicenotes.data.NotesDatabase
+import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.OfflineModelConfig
+import com.k2fsa.sherpa.onnx.OfflineRecognizer
+import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
+import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
 import kotlinx.coroutines.launch
 
 private enum class VoiceMode(val label: String) {
@@ -89,7 +92,7 @@ private fun NotesApp() {
                     }
                 }
                 Text("Офлайн-ограничение", style = MaterialTheme.typography.titleMedium)
-                Text("Голос распознаётся только встроенным on-device распознавателем Android. Если на телефоне нет офлайн-пакета для выбранного языка, диктовка сообщит об этом и не переключится на облако.", style = MaterialTheme.typography.bodyMedium)
+                Text("Распознавание выполняется локально движком sherpa-onnx с мультиязычной Whisper tiny. Модель включается в APK; интернет во время диктовки не нужен.", style = MaterialTheme.typography.bodyMedium)
                 Text("Заметки хранятся локально в базе данных приложения.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
             }
             editing != null || creating -> {
@@ -162,37 +165,87 @@ private fun startOfflineRecognition(
     onStatus: (String) -> Unit,
     onResult: (String) -> Unit
 ) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-        onStatus("Для строгого офлайн-режима требуется Android 12 или новее."); return
-    }
-    if (!SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
-        onStatus("На этом телефоне нет доступного встроенного офлайн-распознавания. Облачный режим не используется."); return
-    }
-    val recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
-    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-        when (mode) {
-            VoiceMode.MANUAL_RU -> putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
-            VoiceMode.MANUAL_EN -> putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
-            VoiceMode.AUTO, VoiceMode.MIXED -> { /* let the on-device service choose its default language */ }
+    // Whisper tiny is bundled into app/src/main/assets/models by GitHub Actions.
+    // Audio is captured and decoded locally; this code makes no network requests.
+    Thread {
+        var recorder: AudioRecord? = null
+        var recognizer: OfflineRecognizer? = null
+        var stream: com.k2fsa.sherpa.onnx.OfflineStream? = null
+        try {
+            val sampleRate = 16_000
+            val minBytes = AudioRecord.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            check(minBytes > 0) { "Не удалось настроить микрофон (код $minBytes)." }
+            val bufferBytes = maxOf(minBytes, sampleRate * 2 / 2)
+            recorder = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferBytes
+            )
+            check(recorder.state == AudioRecord.STATE_INITIALIZED) { "Не удалось открыть микрофон." }
+
+            val whisperLanguage = when (mode) {
+                VoiceMode.MANUAL_RU -> "ru"
+                VoiceMode.MANUAL_EN -> "en"
+                VoiceMode.AUTO, VoiceMode.MIXED -> ""
+            }
+            val config = OfflineRecognizerConfig(
+                featConfig = FeatureConfig(sampleRate = sampleRate, featureDim = 80),
+                modelConfig = OfflineModelConfig(
+                    whisper = OfflineWhisperModelConfig(
+                        encoder = "models/tiny-encoder.int8.onnx",
+                        decoder = "models/tiny-decoder.int8.onnx",
+                        language = whisperLanguage,
+                        task = "transcribe"
+                    ),
+                    tokens = "models/tiny-tokens.txt",
+                    modelType = "whisper",
+                    numThreads = 2,
+                    provider = "cpu"
+                )
+            )
+            recognizer = OfflineRecognizer(context.assets, config)
+            stream = recognizer.createStream()
+
+            android.os.Handler(context.mainLooper).post { onStatus("Слушаю… говорите до 15 секунд.") }
+            recorder.startRecording()
+            val pcm = ShortArray(sampleRate / 2)
+            val floats = FloatArray(sampleRate / 2)
+            val allSamples = ArrayList<Float>(sampleRate * 15)
+            val startedAt = System.currentTimeMillis()
+            while (System.currentTimeMillis() - startedAt < 15_000) {
+                val count = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
+                if (count <= 0) continue
+                for (i in 0 until count) allSamples.add(pcm[i] / 32768.0f)
+            }
+            recorder.stop()
+            check(allSamples.isNotEmpty()) { "Не получены аудиоданные." }
+            val samples = FloatArray(allSamples.size) { allSamples[it] }
+            stream.acceptWaveform(samples, sampleRate)
+            android.os.Handler(context.mainLooper).post { onStatus("Распознаю речь на устройстве…") }
+            recognizer.decode(stream)
+            val result = recognizer.getResult(stream).text.trim()
+            android.os.Handler(context.mainLooper).post {
+                if (result.isBlank()) onStatus("Речь не распознана. Попробуйте ещё раз.")
+                else {
+                    onResult(result)
+                    onStatus("Готово. Аудио обработано локально.")
+                }
+            }
+        } catch (e: Exception) {
+            android.os.Handler(context.mainLooper).post {
+                onStatus("Ошибка офлайн-распознавания: ${e.message ?: "неизвестная ошибка"}")
+            }
+        } finally {
+            try { if (recorder?.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop() } catch (_: Exception) {}
+            recorder?.release()
+            stream?.release()
+            recognizer?.release()
         }
-    }
-    recognizer.setRecognitionListener(object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) { onStatus("Слушаю… Говорите.") }
-        override fun onBeginningOfSpeech() { onStatus("Речь обнаружена…") }
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() { onStatus("Обрабатываю речь офлайн…") }
-        override fun onError(error: Int) { onStatus("Не удалось распознать речь офлайн (код $error). Проверьте языковые пакеты на устройстве."); recognizer.destroy() }
-        override fun onResults(results: Bundle?) {
-            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-            if (text.isNullOrBlank()) onStatus("Речь не распознана.") else { onResult(text); onStatus("Распознавание завершено. Вставьте текст в заметку.") }
-            recognizer.destroy()
-        }
-        override fun onPartialResults(partialResults: Bundle?) {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-    })
-    recognizer.startListening(intent)
+    }.start()
 }
