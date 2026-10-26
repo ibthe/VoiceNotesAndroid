@@ -13,8 +13,8 @@
 
 1. Распакуйте ZIP и загрузите содержимое папки `VoiceNotesAndroid` в свой GitHub-репозиторий.
 2. Убедитесь, что основная ветка называется `main` или `master`.
-3. Откройте **Actions** и запустите workflow **Build Android APK (offline Whisper)** (либо сделайте push).
-4. Дождитесь окончания workflow. Внизу успешного запуска скачайте артефакт `VoiceNotes-debug-apk-offline-whisper`.
+3. Откройте **Actions** и запустите workflow **VoiceNotes Android — Whisper BASE v0.2.1 (strict model check)** (либо сделайте push).
+4. Дождитесь окончания workflow. Внизу успешного запуска скачайте артефакт `VoiceNotes-APK-WHISPER-BASE-v0.2.1`.
 5. Распакуйте артефакт и установите `app-debug.apk` на Android.
 
 Первичная сборка дольше обычной: CI загружает около 160–180 МБ файлов модели. Сама модель не хранится в исходном ZIP, чтобы архив проекта оставался небольшим; workflow вкладывает её в APK. Поэтому при установке готового APK интернет не нужен для подготовки модели.

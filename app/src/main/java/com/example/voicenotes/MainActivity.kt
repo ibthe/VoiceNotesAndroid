@@ -213,11 +213,15 @@ private fun startOfflineRecognition(
             // that packaged the full-precision decoder. Accept both filenames to avoid
             // a runtime failure when the workflow and app source were updated separately.
             val availableAssets = context.assets.list("models")?.toSet().orEmpty()
-            val requiredAssets = setOf("base-encoder.int8.onnx", "base-tokens.txt")
+            val requiredAssets = setOf("base-encoder.int8.onnx", "base-tokens.txt", "model-version.txt")
             val missingAssets = requiredAssets - availableAssets
             check(missingAssets.isEmpty()) {
                 val listed = if (availableAssets.isEmpty()) "папка assets/models пуста или отсутствует" else availableAssets.sorted().joinToString()
                 "В APK не найдены файлы модели: ${missingAssets.joinToString()}. Обнаружены: $listed. Пересоберите APK последней версией GitHub Actions."
+            }
+            val modelMarker = context.assets.open("models/model-version.txt").bufferedReader().use { it.readText().trim() }
+            check(modelMarker == "whisper-base-int8-v0.2.1") {
+                "Установлен старый APK или упакована не та модель (маркер: $modelMarker). Откройте GitHub Actions → VoiceNotes Android — Whisper BASE v0.2.1 (strict model check) и скачайте артефакт VoiceNotes-APK-WHISPER-BASE-v0.2.1. Не используйте старый артефакт Whisper tiny."
             }
             val decoderFile = when {
                 "base-decoder.int8.onnx" in availableAssets -> "base-decoder.int8.onnx"
