@@ -39,6 +39,7 @@ import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
 import kotlinx.coroutines.launch
+import kotlin.math.sqrt
 
 private enum class VoiceMode(val label: String) {
     AUTO("Авто: русский / English"), MIXED("Смешанная речь RU + EN"), MANUAL_RU("Русский (RU)"), MANUAL_EN("English (EN)")
@@ -65,10 +66,22 @@ private fun NotesApp() {
     var settings by remember { mutableStateOf(false) }
     var mode by remember { mutableStateOf(VoiceMode.AUTO) }
     var status by remember { mutableStateOf("") }
+    var pendingVoiceResult by remember { mutableStateOf<((String) -> Unit)?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) status = "Разрешение получено. Нажмите микрофон ещё раз."
-        else status = "Для диктовки нужно разрешение на микрофон."
+        if (granted) {
+            val receiver = pendingVoiceResult
+            pendingVoiceResult = null
+            if (receiver != null) {
+                status = "Разрешение получено. Запускаю диктовку…"
+                startOfflineRecognition(context, mode, { message -> status = message }, receiver)
+            } else {
+                status = "Разрешение на микрофон получено."
+            }
+        } else {
+            pendingVoiceResult = null
+            status = "Для диктовки нужно разрешение на микрофон. Разрешите доступ в настройках Android."
+        }
     }
 
     Scaffold(
@@ -103,6 +116,7 @@ private fun NotesApp() {
                     onStatus = { status = it },
                     onVoice = { receiveText ->
                         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                            pendingVoiceResult = receiveText
                             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                         } else {
                             startOfflineRecognition(context, mode, { status = it }, receiveText)
@@ -181,7 +195,7 @@ private fun startOfflineRecognition(
             check(minBytes > 0) { "Не удалось настроить микрофон (код $minBytes)." }
             val bufferBytes = maxOf(minBytes, sampleRate * 2 / 2)
             recorder = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 sampleRate,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -199,7 +213,7 @@ private fun startOfflineRecognition(
                 modelConfig = OfflineModelConfig(
                     whisper = OfflineWhisperModelConfig(
                         encoder = "models/tiny-encoder.int8.onnx",
-                        decoder = "models/tiny-decoder.int8.onnx",
+                        decoder = "models/tiny-decoder.onnx",
                         language = whisperLanguage,
                         task = "transcribe"
                     ),
@@ -209,32 +223,83 @@ private fun startOfflineRecognition(
                     provider = "cpu"
                 )
             )
+            // Fail early with a useful message instead of waiting through a silent 15-second capture.
+            val requiredAssets = setOf("tiny-encoder.int8.onnx", "tiny-decoder.onnx", "tiny-tokens.txt")
+            val availableAssets = context.assets.list("models")?.toSet().orEmpty()
+            val missingAssets = requiredAssets - availableAssets
+            check(missingAssets.isEmpty()) {
+                "В APK не найдены файлы модели: ${missingAssets.joinToString()}. Пересоберите APK через GitHub Actions."
+            }
+
+            android.os.Handler(context.mainLooper).post { onStatus("Загружаю локальную модель…") }
             recognizer = OfflineRecognizer(context.assets, config)
             stream = recognizer.createStream()
 
-            android.os.Handler(context.mainLooper).post { onStatus("Слушаю… говорите до 15 секунд.") }
             recorder.startRecording()
-            val pcm = ShortArray(sampleRate / 2)
-            val floats = FloatArray(sampleRate / 2)
-            val allSamples = ArrayList<Float>(sampleRate * 15)
+            check(recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                "Микрофон не начал запись. Проверьте разрешение на микрофон в настройках Android."
+            }
+            val pcm = ShortArray(sampleRate / 2) // 0.5-second chunks at 16 kHz
+            val allSamples = ArrayList<Float>(sampleRate * 10)
             val startedAt = System.currentTimeMillis()
-            while (System.currentTimeMillis() - startedAt < 15_000) {
+            var lastStatusAt = 0L
+            var speechDetected = false
+            var silenceMs = 0L
+            val maxDurationMs = 15_000L
+            val silenceToStopMs = 1_800L
+            val speechThreshold = 0.010
+
+            android.os.Handler(context.mainLooper).post { onStatus("Слушаю… говорите. Запись завершится после паузы или через 15 секунд.") }
+            while (System.currentTimeMillis() - startedAt < maxDurationMs) {
                 val count = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
-                if (count <= 0) continue
-                for (i in 0 until count) allSamples.add(pcm[i] / 32768.0f)
+                if (count < 0) {
+                    throw IllegalStateException("Ошибка чтения микрофона (код $count). Попробуйте перезапустить диктовку.")
+                }
+                if (count == 0) continue
+
+                var energy = 0.0
+                for (i in 0 until count) {
+                    val normalized = pcm[i] / 32768.0f
+                    allSamples.add(normalized)
+                    energy += normalized * normalized
+                }
+                val rms = sqrt(energy / count)
+                val chunkDurationMs = count * 1000L / sampleRate
+                if (rms >= speechThreshold) {
+                    speechDetected = true
+                    silenceMs = 0L
+                } else if (speechDetected) {
+                    silenceMs += chunkDurationMs
+                }
+
+                val elapsedMs = System.currentTimeMillis() - startedAt
+                if (elapsedMs - lastStatusAt >= 1_000L) {
+                    val remainingSeconds = ((maxDurationMs - elapsedMs).coerceAtLeast(0L) / 1000L)
+                    val message = if (speechDetected) {
+                        "Запись… осталось максимум ${remainingSeconds} с. После паузы начнётся распознавание."
+                    } else {
+                        "Слушаю… скажите фразу (максимум 15 секунд)."
+                    }
+                    android.os.Handler(context.mainLooper).post { onStatus(message) }
+                    lastStatusAt = elapsedMs
+                }
+
+                if (speechDetected && elapsedMs >= 1_500L && silenceMs >= silenceToStopMs) break
             }
             recorder.stop()
-            check(allSamples.isNotEmpty()) { "Не получены аудиоданные." }
+            check(allSamples.size >= sampleRate / 2) {
+                "Микрофон не передал достаточно аудио. Проверьте разрешение на микрофон и попробуйте ещё раз."
+            }
             val samples = FloatArray(allSamples.size) { allSamples[it] }
+            android.os.Handler(context.mainLooper).post { onStatus("Распознаю речь локально… это может занять несколько секунд.") }
             stream.acceptWaveform(samples, sampleRate)
-            android.os.Handler(context.mainLooper).post { onStatus("Распознаю речь на устройстве…") }
             recognizer.decode(stream)
             val result = recognizer.getResult(stream).text.trim()
             android.os.Handler(context.mainLooper).post {
-                if (result.isBlank()) onStatus("Речь не распознана. Попробуйте ещё раз.")
+                if (result.isBlank()) onStatus("Текст не распознан. Говорите ближе к микрофону и попробуйте ещё раз.")
                 else {
                     onResult(result)
-                    onStatus("Готово. Аудио обработано локально.")
+                    onStatus("Текст добавлен в заметку. Распознавание выполнено на устройстве.")
                 }
             }
         } catch (e: Exception) {
