@@ -208,12 +208,31 @@ private fun startOfflineRecognition(
                 VoiceMode.MANUAL_EN -> "en"
                 VoiceMode.AUTO, VoiceMode.MIXED -> ""
             }
+            // Assets may come from either the newer INT8 workflow or an earlier workflow
+            // that packaged the full-precision decoder. Accept both filenames to avoid
+            // a runtime failure when the workflow and app source were updated separately.
+            val availableAssets = context.assets.list("models")?.toSet().orEmpty()
+            val requiredAssets = setOf("tiny-encoder.int8.onnx", "tiny-tokens.txt")
+            val missingAssets = requiredAssets - availableAssets
+            check(missingAssets.isEmpty()) {
+                val listed = if (availableAssets.isEmpty()) "папка assets/models пуста или отсутствует" else availableAssets.sorted().joinToString()
+                "В APK не найдены файлы модели: ${missingAssets.joinToString()}. Обнаружены: $listed. Пересоберите APK последней версией GitHub Actions."
+            }
+            val decoderFile = when {
+                "tiny-decoder.int8.onnx" in availableAssets -> "tiny-decoder.int8.onnx"
+                "tiny-decoder.onnx" in availableAssets -> "tiny-decoder.onnx"
+                else -> null
+            }
+            check(decoderFile != null) {
+                "В APK не найден декодер Whisper (tiny-decoder.int8.onnx или tiny-decoder.onnx). Обнаружены: ${availableAssets.sorted().joinToString()}. Пересоберите APK последней версией GitHub Actions."
+            }
+
             val config = OfflineRecognizerConfig(
                 featConfig = FeatureConfig(sampleRate = sampleRate, featureDim = 80),
                 modelConfig = OfflineModelConfig(
                     whisper = OfflineWhisperModelConfig(
                         encoder = "models/tiny-encoder.int8.onnx",
-                        decoder = "models/tiny-decoder.onnx",
+                        decoder = "models/$decoderFile",
                         language = whisperLanguage,
                         task = "transcribe"
                     ),
@@ -223,13 +242,6 @@ private fun startOfflineRecognition(
                     provider = "cpu"
                 )
             )
-            // Fail early with a useful message instead of waiting through a silent 15-second capture.
-            val requiredAssets = setOf("tiny-encoder.int8.onnx", "tiny-decoder.onnx", "tiny-tokens.txt")
-            val availableAssets = context.assets.list("models")?.toSet().orEmpty()
-            val missingAssets = requiredAssets - availableAssets
-            check(missingAssets.isEmpty()) {
-                "В APK не найдены файлы модели: ${missingAssets.joinToString()}. Пересоберите APK через GitHub Actions."
-            }
 
             android.os.Handler(context.mainLooper).post { onStatus("Загружаю локальную модель…") }
             recognizer = OfflineRecognizer(context.assets, config)
