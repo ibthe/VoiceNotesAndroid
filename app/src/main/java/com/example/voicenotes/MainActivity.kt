@@ -42,7 +42,7 @@ import kotlinx.coroutines.launch
 import kotlin.math.sqrt
 
 private enum class VoiceMode(val label: String) {
-    AUTO("Авто: русский / English"), MIXED("Смешанная речь RU + EN"), MANUAL_RU("Русский (RU)"), MANUAL_EN("English (EN)")
+    AUTO("Авто: русский / English"), MIXED("RU + EN (экспериментально)"), MANUAL_RU("Русский (RU)"), MANUAL_EN("English (EN)")
 }
 
 class MainActivity : ComponentActivity() {
@@ -98,6 +98,7 @@ private fun NotesApp() {
             settings -> Column(Modifier.padding(padding).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Text("Голосовой ввод", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                 Text("Режим распознавания", style = MaterialTheme.typography.titleMedium)
+                Text("Для русской речи с английскими терминами сначала попробуйте режим RU. Автоопределение языка не гарантирует точное распознавание каждого переключения между русским и английским.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 VoiceMode.values().forEach { item ->
                     Row(Modifier.fillMaxWidth().clickable { mode = item }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(selected = mode == item, onClick = { mode = item })
@@ -105,7 +106,7 @@ private fun NotesApp() {
                     }
                 }
                 Text("Офлайн-ограничение", style = MaterialTheme.typography.titleMedium)
-                Text("Распознавание выполняется локально движком sherpa-onnx с мультиязычной Whisper tiny. Модель включается в APK; интернет во время диктовки не нужен.", style = MaterialTheme.typography.bodyMedium)
+                Text("Распознавание выполняется локально движком sherpa-onnx с мультиязычной Whisper base INT8. Эта модель больше и обычно точнее tiny, но может работать медленнее на слабых телефонах. Модель включается в APK; интернет во время диктовки не нужен.", style = MaterialTheme.typography.bodyMedium)
                 Text("Заметки хранятся локально в базе данных приложения.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
             }
             editing != null || creating -> {
@@ -179,7 +180,7 @@ private fun startOfflineRecognition(
     onStatus: (String) -> Unit,
     onResult: (String) -> Unit
 ) {
-    // Whisper tiny is bundled into app/src/main/assets/models by GitHub Actions.
+    // Multilingual Whisper base INT8 is bundled into app/src/main/assets/models by GitHub Actions.
     // Audio is captured and decoded locally; this code makes no network requests.
     Thread {
         var recorder: AudioRecord? = null
@@ -212,33 +213,33 @@ private fun startOfflineRecognition(
             // that packaged the full-precision decoder. Accept both filenames to avoid
             // a runtime failure when the workflow and app source were updated separately.
             val availableAssets = context.assets.list("models")?.toSet().orEmpty()
-            val requiredAssets = setOf("tiny-encoder.int8.onnx", "tiny-tokens.txt")
+            val requiredAssets = setOf("base-encoder.int8.onnx", "base-tokens.txt")
             val missingAssets = requiredAssets - availableAssets
             check(missingAssets.isEmpty()) {
                 val listed = if (availableAssets.isEmpty()) "папка assets/models пуста или отсутствует" else availableAssets.sorted().joinToString()
                 "В APK не найдены файлы модели: ${missingAssets.joinToString()}. Обнаружены: $listed. Пересоберите APK последней версией GitHub Actions."
             }
             val decoderFile = when {
-                "tiny-decoder.int8.onnx" in availableAssets -> "tiny-decoder.int8.onnx"
-                "tiny-decoder.onnx" in availableAssets -> "tiny-decoder.onnx"
+                "base-decoder.int8.onnx" in availableAssets -> "base-decoder.int8.onnx"
+                "base-decoder.onnx" in availableAssets -> "base-decoder.onnx"
                 else -> null
             }
             check(decoderFile != null) {
-                "В APK не найден декодер Whisper (tiny-decoder.int8.onnx или tiny-decoder.onnx). Обнаружены: ${availableAssets.sorted().joinToString()}. Пересоберите APK последней версией GitHub Actions."
+                "В APK не найден декодер Whisper (base-decoder.int8.onnx или base-decoder.onnx). Обнаружены: ${availableAssets.sorted().joinToString()}. Пересоберите APK последней версией GitHub Actions."
             }
 
             val config = OfflineRecognizerConfig(
                 featConfig = FeatureConfig(sampleRate = sampleRate, featureDim = 80),
                 modelConfig = OfflineModelConfig(
                     whisper = OfflineWhisperModelConfig(
-                        encoder = "models/tiny-encoder.int8.onnx",
+                        encoder = "models/base-encoder.int8.onnx",
                         decoder = "models/$decoderFile",
                         language = whisperLanguage,
                         task = "transcribe"
                     ),
-                    tokens = "models/tiny-tokens.txt",
+                    tokens = "models/base-tokens.txt",
                     modelType = "whisper",
-                    numThreads = 2,
+                    numThreads = 4,
                     provider = "cpu"
                 )
             )
@@ -257,11 +258,12 @@ private fun startOfflineRecognition(
             var lastStatusAt = 0L
             var speechDetected = false
             var silenceMs = 0L
-            val maxDurationMs = 15_000L
-            val silenceToStopMs = 1_800L
-            val speechThreshold = 0.010
+            val maxDurationMs = 45_000L
+            val silenceToStopMs = 2_200L
+            // A lower threshold helps avoid cutting off quieter speech on phone microphones.
+            val speechThreshold = 0.006
 
-            android.os.Handler(context.mainLooper).post { onStatus("Слушаю… говорите. Запись завершится после паузы или через 15 секунд.") }
+            android.os.Handler(context.mainLooper).post { onStatus("Слушаю… говорите. Запись завершится после паузы или через 45 секунд.") }
             while (System.currentTimeMillis() - startedAt < maxDurationMs) {
                 val count = recorder.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
                 if (count < 0) {
@@ -290,7 +292,7 @@ private fun startOfflineRecognition(
                     val message = if (speechDetected) {
                         "Запись… осталось максимум ${remainingSeconds} с. После паузы начнётся распознавание."
                     } else {
-                        "Слушаю… скажите фразу (максимум 15 секунд)."
+                        "Слушаю… скажите фразу (максимум 45 секунд)."
                     }
                     android.os.Handler(context.mainLooper).post { onStatus(message) }
                     lastStatusAt = elapsedMs
@@ -299,6 +301,9 @@ private fun startOfflineRecognition(
                 if (speechDetected && elapsedMs >= 1_500L && silenceMs >= silenceToStopMs) break
             }
             recorder.stop()
+            check(speechDetected) {
+                "Речь не обнаружена. Попробуйте говорить ближе к микрофону, уменьшить шум или выбрать режим RU/EN вручную."
+            }
             check(allSamples.size >= sampleRate / 2) {
                 "Микрофон не передал достаточно аудио. Проверьте разрешение на микрофон и попробуйте ещё раз."
             }
