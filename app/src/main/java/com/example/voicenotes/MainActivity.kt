@@ -213,23 +213,15 @@ private fun startOfflineRecognition(
             // that packaged the full-precision decoder. Accept both filenames to avoid
             // a runtime failure when the workflow and app source were updated separately.
             val availableAssets = context.assets.list("models")?.toSet().orEmpty()
-            val expectedMarker = "whisper-base-int8-v0.2.2"
-            val requiredAssets = setOf("base-encoder.int8.onnx", "base-tokens.txt", "model-version.txt", "model-build-info.txt")
+            val requiredAssets = setOf("base-encoder.int8.onnx", "base-tokens.txt", "model-version.txt")
             val missingAssets = requiredAssets - availableAssets
-            val marker = if ("model-version.txt" in availableAssets) {
-                runCatching { context.assets.open("models/model-version.txt").bufferedReader().use { it.readText().trim() } }.getOrNull()
-            } else null
-            val tinyAssets = availableAssets.filter { it.startsWith("tiny-") || it.startsWith("tiny.") }
-            if (missingAssets.isNotEmpty() || marker != expectedMarker || tinyAssets.isNotEmpty()) {
+            check(missingAssets.isEmpty()) {
                 val listed = if (availableAssets.isEmpty()) "папка assets/models пуста или отсутствует" else availableAssets.sorted().joinToString()
-                val oldModelNote = if (tinyAssets.isNotEmpty()) " В этом APK найдена Whisper TINY, а не BASE." else ""
-                throw IllegalStateException(
-                    "Неверная модель в APK. Ожидался маркер $expectedMarker, найден: ${marker ?: "нет маркера"}. " +
-                    "Не хватает: ${missingAssets.ifEmpty { emptySet<String>() }.joinToString().ifBlank { "нет" }}. " +
-                    "Файлы в APK: $listed.$oldModelNote Откройте GitHub Actions и запустите workflow " +
-                    "'VoiceNotes BASE v0.2.2 — FORCE BASE MODEL AND VERIFY APK SIZE'. Скачайте только артефакт " +
-                    "'VoiceNotes-BASE-v0.2.2-APK-VERIFIED'. В успешных логах должны быть строки VERIFIED_APK_BYTES и VERIFIED_MODEL_BYTES; APK должен быть не менее 150 000 000 байт."
-                )
+                "В APK не найдены файлы модели: ${missingAssets.joinToString()}. Обнаружены: $listed. Пересоберите APK последней версией GitHub Actions."
+            }
+            val modelMarker = context.assets.open("models/model-version.txt").bufferedReader().use { it.readText().trim() }
+            check(modelMarker == "whisper-base-int8-v0.2.2") {
+                "Установлен старый APK или упакована не та модель (маркер: $modelMarker). Откройте GitHub Actions → VoiceNotes Android — BASE v0.2.2 VERIFIED и скачайте артефакт VoiceNotes-APK-BASE-VERIFIED-v0.2.2. Не используйте старый артефакт Whisper tiny."
             }
             val decoderFile = when {
                 "base-decoder.int8.onnx" in availableAssets -> "base-decoder.int8.onnx"
